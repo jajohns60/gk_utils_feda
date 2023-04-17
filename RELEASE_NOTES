@@ -1,0 +1,11 @@
+========================================
+Release 1.0.1
+========================================
+First release of gk-utils.pl outside of $GK_SCRIPTS_DIR
+Used in initial release of Xe3p
+Must be used with $GK_SCRIPTS_DIR version 2.0.8
+gk-utils.pl has very minimal changes from $GK_SCRIPTS_DIR version
+
+
+
+
