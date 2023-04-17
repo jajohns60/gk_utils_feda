@@ -1,0 +1,650 @@
+#!/usr/intel/pkgs/perl/5.26.1/bin/perl
+
+use strict;
+use warnings;
+
+use FindBin;
+
+FindBin::again();
+my ($systemRoot);
+BEGIN {
+  $systemRoot = $ENV{GK_UTILS_DIR} || $FindBin::RealBin;
+  $systemRoot =~ s|/nfs/(\w+)/disks|/nfs/site/disks|;
+
+  print "System Root = ${systemRoot}\n" unless ($ENV{QUIET_MODE});
+  unshift(@INC, $systemRoot);
+  unshift(@INC, "${systemRoot}/lib");
+}
+
+use Data::Dumper;
+use File::Basename;
+use File::Spec::Functions qw(catdir);
+use Getopt::Long qw(&GetOptionsFromString);
+use GkConfig;
+use GkUtil qw(:DEFAULT :print);
+
+$Data::Dumper::Sortkeys = 1;
+my $prefix = basename($0);
+GkUtil::set_prefix($prefix);
+my $die = 0;
+
+##-------------------------------------------------------------------------------------------------------
+## Setup the basic quickbuild script options
+##-------------------------------------------------------------------------------------------------------
+my %base_options_cfg =
+  (bool   =>
+   {
+    debug => 0,
+    help => 0,
+    mail => 1,
+    turnin => 0,
+    clean => $ENV{GK_MOCK_CLEAN} || 0,
+    pretend => 0,
+    local_gk_utils => 0,
+   },
+   num    =>
+   {
+    line_width => 120,
+   },
+   string =>
+   {
+    stepping => $ENV{GK_STEP} || $ENV{GK_STEPPING},
+    cluster => $ENV{GK_CLUSTER},
+    gkcfgdir => $ENV{GK_CONFIG_DIR} || $systemRoot,
+    gkcfg => $ENV{GK_CONFIG_FILE},
+    cfgdir => $ENV{GK_UTILS_CONFIG_DIR},
+    cfgfile => $ENV{GK_UTILS_CONFIG_FILE},
+    event => 'mock',
+    gk_utils_options => '',
+   },
+   argv   =>
+   {
+   },
+  );
+
+my %option_aliases =
+  (
+   cluster => [qw(c)],
+   stepping => [qw(s)],
+   debug => [qw(d)],
+   help => [qw(h)],
+  );
+
+my %options = ();
+Getopt::Long::Configure(qw(pass_through));
+&get_options(\%options, \%base_options_cfg, \%option_aliases);
+GkUtil::set_debug($options{debug});
+
+##-------------------------------------------------------------------------------------------------------
+## Determine MODEL_ROOT
+##-------------------------------------------------------------------------------------------------------
+{
+  local @INC = @INC;
+  unshift(@INC, "$ENV{RTL_PROJ_BIN}/perllib");
+  require ModelRootUtils;
+  my $mr = &ModelRootUtils::GetModelPath(@ARGV);
+  &fatal_error("Cannot determine the model: use -ver option or set MODEL_ROOT") unless ($mr);
+  &ModelRootUtils::SetModelRoot($mr);
+}
+
+##-------------------------------------------------------------------------------------------------------
+## Determine the Config Directory and File
+##-------------------------------------------------------------------------------------------------------
+if (!$options{gkcfgdir} || !(-d $options{gkcfgdir})) {
+  &fatal_error("Did not specifiy a valid -gkcfgdir setting" . (($options{gkcfgdir})? " ($options{gkcfgdir})" : ""));
+}
+$options{gkcfgdir} =~ s|/+$||;
+$ENV{GK_CONFIG_DIR} = $options{gkcfgdir};
+$GkConfig::systemRoot = $systemRoot;
+
+if ($options{gkcfg} && !(-e $options{gkcfg})) {
+  &fatal_error("Did not specifiy a valid -gkcfg setting ($options{gkcfg})");
+}
+
+if ($options{fgfile} && !(-e $options{fgfile})) {
+  &fatal_error("Did not specifiy a valid -cfgfile setting ($options{cfgfile})");
+}
+
+##-------------------------------------------------------------------------------------------------------
+## Load the configuration file
+##-------------------------------------------------------------------------------------------------------
+# Set the event type to get that recipe
+$ENV{GK_EVENTTYPE} = $options{event};
+
+# Load first version to get defaults if they are different
+# The idea here is that a project can set a default in the GkConfig file if one is not set in the
+# environment. An example would be to set a default cluster/stepping to a superset recipe
+{
+  local (%GkConfig, %Models);
+  local %ENV = %ENV;
+  delete($ENV{GK_UTILS_CONFIG_DIR});
+  $ENV{QUIET_MODE} = 1 unless ($options{debug});
+  &set_pipeline(0, 1);
+  GkConfig::load_GkConfig($options{gkcfg});
+  &set_pipeline(0, 1);
+  $options{stepping} = $ENV{GK_STEP} if ($ENV{GK_STEP});
+  $options{cluster} = $ENV{GK_CLUSTER} if ($ENV{GK_CLUSTER});
+  $options{cfgdir} = $ENV{GK_UTILS_CONFIG_DIR} if ($ENV{GK_UTILS_CONFIG_DIR} && !$options{cfgdir});
+}
+&set_pipeline(1);
+
+# Figure out the recipe directory
+$options{cfgdir} ||= $ENV{GK_UTILS_CONFIG_DIR} || $ENV{GK_CONFIG_DIR} || $systemRoot;
+GkUtil::process_cmd_subs(\$options{cfgdir},
+                         {MODEL_ROOT => $ENV{MODEL_ROOT},
+                          PROGRAM_DIR => $systemRoot,
+                          GK_CONFIG_DIR => $ENV{GK_CONFIG_DIR}});
+$ENV{GK_UTILS_CONFIG_DIR} = $options{cfgdir};
+
+# Load the real configs
+GkConfig::load_GkConfig($options{gkcfg});
+GkConfig::load_GkUtilsConfig($options{cfgfile});
+
+&debug(Data::Dumper->Dump([\%options], [qw(*options)]));
+
+##-------------------------------------------------------------------------------------------------------
+## Set up clean jobs for builds
+##-------------------------------------------------------------------------------------------------------
+$ENV{GK_MOCK_CLEAN} = $options{clean};
+
+##-------------------------------------------------------------------------------------------------------
+## Get Perl Recipe
+##-------------------------------------------------------------------------------------------------------
+my @GK_RECIPE = ();
+{
+  local %ENV = %ENV;
+  $ENV{QUIET_MODE} = 1;
+  my $command = "gk-utils.pl";
+  $command = catdir($systemRoot, $command) if ($options{local_gk_utils});
+  $command .= " -recipe_perl";
+  my @cmd_output = ();
+  if (GkUtil::run_command("${command}", \@cmd_output)) {
+    eval join("\n", @cmd_output);
+    &fatal_error("Unable to load perl recipe: ${@}") if ($@);
+  } else {
+    &fatal_error("Unable to get perl recipe: ", join("\n", @cmd_output));
+  }
+}
+
+##-------------------------------------------------------------------------------------------------------
+## Get List of Valid Options from Recipe
+##-------------------------------------------------------------------------------------------------------
+# Order of specificity and priority
+# Job at bottom has highest of both
+my @option_types =
+  qw(
+      dut
+      job_type
+      job
+   );
+
+my %valid_options = map { $_ => {}, } @option_types;
+
+# Get the valid list of each option from the recipe
+foreach my $job (@GK_RECIPE) {
+  foreach my $type (@option_types) {
+    my $option;
+    if ((uc $type) eq 'JOB') {
+      if (defined $job->{NAME}) {
+        $option = $job->{NAME};
+        $valid_options{$type}{$option} = $job;
+      }
+    } elsif (defined $job->{(uc $type)}) {
+      $option = $job->{(uc $type)};
+      $valid_options{$type}{$option}++;
+    }
+  }
+}
+
+&debug(Data::Dumper->Dump([\%valid_options], [qw(*valid_options)]));
+
+##-------------------------------------------------------------------------------------------------------
+## Create option configuration and parse remaning command line
+##-------------------------------------------------------------------------------------------------------
+my %recipe_options = ();
+my %recipe_default_options = ();
+my %recipe_opt_cfg = (bool => {}, num => {}, string => {}, argv => {},);
+
+my %used_options = ();
+my $recipe_usage_string;
+foreach my $type (@option_types) {
+  my $uc_type = (uc $type);
+  my $valid_ref = $valid_options{$type};
+  my @valid_values = (sort keys %$valid_ref);
+
+  $recipe_usage_string .= "\tValid ${uc_type}S\n";
+  my $tmp_string = "";
+  foreach my $value (@valid_values) {
+    if ($options{line_width} && (length($tmp_string) >= $options{line_width})) {
+      $recipe_usage_string .= "\t${tmp_string},\n";
+      $tmp_string = "";
+    } elsif ($tmp_string) {
+      $tmp_string .= ", ${value}";
+    } else {
+      $tmp_string = $value;
+    }
+  }
+  $recipe_usage_string .= "\t${tmp_string}\n" if ($tmp_string);
+
+  $recipe_usage_string .= "\n\tValid ${uc_type} Options\n";
+  foreach my $option (@valid_values) {
+    my $option_name = &get_option_name($option);
+
+    # Detect options that are shared between types, delete the more specific option, and warn about it
+    if (exists $used_options{$option_name}) {
+      &warning("${uc_type} '${option_name}' is same as $used_options{$option_name}, removing from ${uc_type} list.");
+      delete($valid_ref->{$option});
+      next;
+    }
+    $used_options{$option_name} = $type;
+
+    # Default is blank
+    $recipe_opt_cfg{bool}{$option_name} = undef;
+    $recipe_usage_string .= <<EOS;
+	-[no]${option_name}
+		enables or disables the ${uc_type} ${option}
+EOS
+
+    if ((ref $valid_ref->{$option}) eq 'HASH') {
+      # Default is no extra options
+      $recipe_opt_cfg{string}{"args_${option_name}"} = "";
+
+      # Default is current gating status
+      $recipe_opt_cfg{bool}{"gate_${option_name}"} = $valid_ref->{$option}{GATING};
+
+      $recipe_usage_string .= <<EOS;
+	-[no]gate_${option_name}
+		changes the gating status for the ${uc_type} ${option}
+	-args_${option_name}
+		adds command line options to the end of the command line for the ${uc_type} ${option}
+EOS
+    }
+
+    $recipe_usage_string .= "\n";
+  }
+}
+
+# Parse any default recipe options
+if (exists $Models{quickbuild_default_options}) {
+  my $default_options;
+  my $type;
+  if ($type = (ref $Models{quickbuild_default_options})) {
+    if ($type eq 'HASH') {
+      if (exists $Models{quickbuild_default_options}{$options{cluster}}) {
+        if ($type = (ref $Models{quickbuild_default_options}{$options{cluster}})) {
+          if ($type eq 'HASH') {
+            if (exists $Models{quickbuild_default_options}{$options{cluster}}{$options{stepping}}) {
+              if ($type = (ref $Models{quickbuild_default_options}{$options{cluster}}{$options{stepping}})) {
+                &fatal_error("Type ${type} not supported for \$Models{quickbuild_default_options}{$options{cluster}}{$options{stepping}}");
+              } else {
+                $default_options = $Models{quickbuild_default_options}{$options{cluster}}{$options{stepping}};
+              }
+            } elsif (exists $Models{quickbuild_default_options}{$options{cluster}}{default}) {
+              if ($type = (ref $Models{quickbuild_default_options}{$options{cluster}}{default})) {
+                &fatal_error("Type ${type} not supported for \$Models{quickbuild_default_options}{$options{cluster}}{default}");
+              } else {
+                $default_options = $Models{quickbuild_default_options}{$options{cluster}}{default};
+              }
+            }
+          } else {
+            &fatal_error("Type ${type} not supported for \$Models{quickbuild_default_options}{$options{cluster}}");
+          }
+        } else {
+          $default_options = $Models{quickbuild_default_options}{$options{cluster}};
+        }
+      } elsif (exists $Models{quickbuild_default_options}{$options{stepping}}) {
+        if ($type = (ref $Models{quickbuild_default_options}{$options{stepping}})) {
+          &fatal_error("Type ${type} not supported for \$Models{quickbuild_default_options}{$options{stepping}}");
+        } else {
+          $default_options = $Models{quickbuild_default_options}{$options{stepping}};
+        }
+      } elsif (exists $Models{quickbuild_default_options}{default}) {
+        if ($type = (ref $Models{quickbuild_default_options}{default})) {
+          &fatal_error("Type ${type} not supported for \$Models{quickbuild_default_options}{default}");
+        } else {
+          $default_options = $Models{quickbuild_default_options}{default};
+        }
+      }
+    } else {
+      &fatal_error("Type ${type} not supported for \$Models{quickbuild_default_options}");
+    }
+  } else {
+    $default_options = $Models{quickbuild_default_options};
+  }
+
+  &info("Parsing default options from GkUtils file: `${default_options}`");
+  &get_options(\%recipe_default_options, \%recipe_opt_cfg, undef, $default_options);
+  foreach my $option (sort keys %recipe_default_options) {
+    foreach my $type (sort keys %recipe_opt_cfg) {
+      if (exists $recipe_opt_cfg{$type}{$option}) {
+        $recipe_opt_cfg{$type}{$option} = $recipe_default_options{$option};
+      }
+    }
+  }
+}
+
+# Parse the command line recipe options
+Getopt::Long::Configure(qw(no_pass_through));
+&get_options(\%recipe_options, \%recipe_opt_cfg);
+
+&debug(Data::Dumper->Dump([\%recipe_options], [qw(*recipe_options)]));
+
+##-------------------------------------------------------------------------------------------------------
+## Handle options and generate environment variables for passing to gk-utils
+##-------------------------------------------------------------------------------------------------------
+# List of options by type
+my %reduced_list = ();
+# Which types need to have all non-specified options added to keep too many jobs from getting pruned
+my %need_positive_fill = ();
+
+# First Pass: Check which types of options have been specified
+foreach my $type (@option_types) {
+  my $valid_ref = $valid_options{$type};
+  foreach my $option (sort keys %$valid_ref) {
+    my $option_name = &get_option_name($option);
+
+    if (defined $recipe_options{$option_name}) {
+      # 1 => only negative options
+      # 0 => some positive options
+      # undef => no options
+      $need_positive_fill{$type} ||= !$recipe_options{$option_name};
+    }
+  }
+}
+&debug(Data::Dumper->Dump([\%need_positive_fill], [qw(*need_positive_fill)]));
+
+# Second Pass: Deteremine the level with the lowest specificity to add options to if necessary
+foreach my $type (@option_types) {
+  # Tracking variable shows if there are any additive options
+  my $added = 1;
+
+  # Go through all the other types to find out if the are only negative
+  foreach my $other_type (@option_types) {
+    next if ($type eq $other_type);
+    if (defined $need_positive_fill{$other_type}) {
+      # 1 => only negative options
+      # 0 => some positive options
+      # undef => no options
+      $added &&= $need_positive_fill{$other_type};
+    }
+  }
+
+  # Only negative options are specified at this and all lower levels. Add options to this level and stop.
+  my $clear = 0;
+  if ($added) {
+    if (!(defined $need_positive_fill{$type})) {
+      &info("ADDING OPTIONS");
+      $need_positive_fill{$type} = 1;
+      $clear = 1;
+    } elsif (!$need_positive_fill{$type}) {
+      $clear = 1;
+    }
+  } else {
+    $clear = 1;
+  }
+
+  # Clear the lower levels
+  if ($clear) {
+    my $start = 0;
+    foreach my $other_type (@option_types) {
+      if ($other_type eq $type) {
+        $start = 1;
+        next;
+      }
+      delete($need_positive_fill{$other_type}) if ($start);
+    }
+    last;
+  }
+}
+&debug(Data::Dumper->Dump([\%need_positive_fill], [qw(*need_positive_fill)]));
+
+# Generate the environment variables
+# Only set the variables if any options passed to them
+foreach my $type (@option_types) {
+  my $valid_ref = $valid_options{$type};
+  foreach my $option (sort keys %$valid_ref) {
+    my $option_name = &get_option_name($option);
+
+    # Reduced Mode Enable/Disable options
+    if (defined $recipe_options{$option_name}) {
+      if ($recipe_options{$option_name}) {
+        push(@{$reduced_list{$type}{reduced}}, "+${option}");
+      } else {
+        push(@{$reduced_list{$type}{reduced}}, "-${option}");
+      }
+    } elsif ($need_positive_fill{$type}) {
+      push(@{$reduced_list{$type}{reduced}}, "+${option}");
+    }
+
+    # Adding arguments options
+    if ($recipe_options{"args_${option_name}"}) {
+      push(@{$reduced_list{$type}{args}}, join(';', $option, $recipe_options{"args_${option_name}"}));
+    }
+
+    # Changing gate options
+    if (exists $recipe_options{"gate_${option_name}"}) {
+      my $opt_gating = $recipe_options{"gate_${option_name}"};
+      if ($opt_gating != $valid_ref->{$option}{GATING}) {
+        if ($opt_gating) {
+          push(@{$reduced_list{$type}{gate}}, "+${option}");
+        } else {
+          push(@{$reduced_list{$type}{gate}}, "-${option}");
+        }
+      }
+    }
+  }
+
+  # Set or delete the environment variables
+  foreach my $action_type (qw(reduced args gate)) {
+    my $delim = ' ';
+    $delim = ';' if ($action_type eq 'args');
+
+    my $env_name = "GK_" . (uc $action_type) . '_' . (uc $type) . "S";
+    if ($reduced_list{$type}{$action_type} && @{$reduced_list{$type}{$action_type}}) {
+      $ENV{$env_name} = join($delim, @{$reduced_list{$type}{$action_type}});
+      &info("\$ENV{${env_name}} = $ENV{$env_name}");
+    } else {
+      delete($ENV{$env_name});
+    }
+  }
+}
+&debug(Data::Dumper->Dump([\%reduced_list], [qw(*reduced_list)]));
+
+##-------------------------------------------------------------------------------------------------------
+## Show usage/help
+##-------------------------------------------------------------------------------------------------------
+$die = 1 if ($options{help});
+
+&usage(1) if ($die);
+
+##-------------------------------------------------------------------------------------------------------
+## Run turnin or gk-utils command
+##-------------------------------------------------------------------------------------------------------
+my $command;
+
+if ($options{turnin}) {
+  $command = "turnin -local -nocheck";
+  $command .= ' -no_mail' unless ($options{mail});
+} else {
+  $command = "gk-utils.pl";
+  $command = catdir($systemRoot, $command) if ($options{local_gk_utils});
+  $command .= " $options{gk_utils_options}" if ($options{gk_utils_options});
+}
+
+&info("Running command: '${command}'");
+exec($command) unless ($options{pretend});
+exit(0);
+
+##-------------------------------------------------------------------------------------------------------
+## Subroutines
+##-------------------------------------------------------------------------------------------------------
+
+##-------------------------------------------------------------------------------------------------------
+## get_options()
+##   Changes given command line option hash based on given options cfg hash
+##   Optional parameter aliases hash adds command line aliases
+##   Optional parameter arg_string is used instead of @ARGV
+##-------------------------------------------------------------------------------------------------------
+sub get_options {
+  my ($opt_hash, $opt_cfg_hash, $aliases, $arg_string) = @_;
+  $aliases = {} unless ($aliases);
+
+  my @types = qw(bool num string argv);
+
+  my %opt_cfg = %$opt_cfg_hash;
+  foreach my $type (@types) {
+    $opt_cfg{$type} = {} unless ($opt_cfg{$type} && ((ref $opt_cfg{$type}) eq 'HASH'));
+  }
+
+  my %options = (map { %{$opt_cfg{$_}} } @types);
+  my %option_strings = (
+                        (map { $_ => "${_}!" } (keys %{$opt_cfg{bool}})),
+                        (map { $_ => "${_}=i" } (keys %{$opt_cfg{num}})),
+                        (map { $_ => "${_}=s" } (keys %{$opt_cfg{string}})),
+                       );
+
+  if ($aliases && %$aliases) {
+    foreach my $option (sort keys %$aliases) {
+      if (exists $option_strings{$option}) {
+        my $alias_string = join('|', @{$$aliases{$option}});
+        $option_strings{$option} =~ s/(=|!)/|${alias_string}${1}/;
+      }
+    }
+  }
+
+  if (defined $arg_string) {
+    GetOptionsFromString($arg_string, \%options, values(%option_strings));
+  } else {
+    GetOptions(\%options, values(%option_strings));
+  }
+
+  foreach my $option (keys %{$opt_cfg{argv}}) {
+    if (@ARGV) {
+      $options{$option} = join(' ', @ARGV);
+    } else {
+      $options{$option} = $opt_cfg{argv}{$option};
+    }
+  }
+
+  foreach my $option (keys %options) {
+    $$opt_hash{$option} = $options{$option};
+  }
+}                               # sub get_options
+
+##-------------------------------------------------------------------------------------------------------
+## set_pipeline()
+##   Set Cluster and Stepping environment variables to select pipeline
+##   Optional parameter fatal causes script to die if cluster or stepping undefined
+##   Optional parameter quiet forces script to print or not print (ignore script-wide quiet mode)
+##-------------------------------------------------------------------------------------------------------
+sub set_pipeline {
+  my ($fatal, $quiet) = @_;
+  $quiet = &GkUtil::is_quiet() unless (defined $quiet);
+
+  ## Determine the cluster recipe to use
+  if ($options{cluster}) {
+    $ENV{GK_CLUSTER} = $options{cluster};
+  }
+
+  if ($ENV{GK_CLUSTER}) {
+    &info("Using Cluster: $ENV{GK_CLUSTER}") unless ($quiet);
+  } elsif ($fatal) {
+    &fatal_error("No Cluster specified!");
+  }
+
+  ## Determine the stepping recipe to use
+  if ($options{stepping}) {
+    $ENV{GK_STEP} = $ENV{GK_STEPPING} = $options{stepping};
+  } elsif ($ENV{GK_STEPPING}) {
+    $ENV{GK_STEP} = $ENV{GK_STEPPING};
+  }
+
+  if ($ENV{GK_STEP}) {
+    &info("Using Stepping: $ENV{GK_STEP}") unless ($quiet);
+  } elsif ($fatal) {
+    &fatal_error("No Stepping specified!");
+  }
+}                               # sub set_pipeline
+
+##-------------------------------------------------------------------------------------------------------
+## get_option_name()
+##   Returns valid lowercase name of given option with bad characters replaced by _
+##-------------------------------------------------------------------------------------------------------
+sub get_option_name {
+  my ($option) = @_;
+  my $opt_string = (lc $option);
+  $opt_string =~ tr/\./_/;
+  return $opt_string;
+}                               # sub get_option_name
+
+##-------------------------------------------------------------------------------------------------------
+## usage()
+##   Prints quickbuld usage information
+##-------------------------------------------------------------------------------------------------------
+sub usage {
+  my ($die) = @_;
+  $die = 0 unless (defined $die);
+
+my $usage = <<EOS;
+
+${prefix}:
+	Usage
+	${prefix} [required options] [basic options] [recipe options]
+
+${prefix}:
+	Required Options
+ 	[-cluster <cluster>] [-stepping <stepping>]
+	[-gkcfgdir <GkConfig dir>] [-gkcfg <GkConfig file>] [-cfgdir <GkUtils dir>] [-cfgfile <GkUtils file>]
+
+	-cluster <cluster>
+		sets the cluster to use for the mock turnin flow
+		(Default: \$ENV{GK_CLUSTER})
+
+	-stepping <stepping>
+		sets the stepping to use for the mock turnin flow
+		(Default: \$ENV{GK_STEPPING})
+
+	-gkcfgdir <GkConfig dir>
+		sets the directory to search for the GkConfig file unless -gkcfg is set
+		(Default: \$ENV{GK_CONFIG_DIR})
+		*Required if -gkcfg and default not set
+
+	-gkcfg <GkConfig file>
+		sets the GkConfig file to use
+		(Default: <none>)
+
+	-cfgdir <GkUtils dir>
+		sets the directory to search for the GkUtils recipe config file unless -cfgfile is set
+		(Default: \$ENV{GK_UTILS_CONFIG_DIR})
+		*Required if -cfgfile and default not set (typically set in GkConfig file)
+
+	-cfgfile <GkUtils file>
+		sets the GkUtils recipe config file to use
+		(Default: <none>)
+
+	Valid Basic Options
+	[-[no]debug] [-help]
+
+	-[no]debug
+		enables or disables debug output from quickbuild main process
+		(Default: disabled)
+
+	-help
+		display this message and exit
+
+EOS
+
+  if ($recipe_usage_string) {
+    $usage .= "\tRecipe Options\n\n${recipe_usage_string}";
+  }
+
+  if ($die) {
+    die $usage;
+  } else {
+    print $usage;
+    exit(0);
+  }
+}                               # sub usage
+
+
+__END__
